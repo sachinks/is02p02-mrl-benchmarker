@@ -1,0 +1,7 @@
+requests
+numpy
+matplotlib
+fastapi
+uvicorn[standard]
+psutil
+pydantic-settings
