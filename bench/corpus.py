@@ -1,9 +1,20 @@
-"""Benchmark dataset: corpus, queries, and a hand-labeled sanity set.
+"""bench/corpus.py — benchmark dataset: corpus, queries, and sanity labels.
 
-CORPUS  : list of (id, text, topic) documents to search over.
-QUERIES : list of (query_text, expected_topic) search queries.
-SANITY  : query_text -> set of doc ids that are *obviously* relevant.
-          Used to confirm the full-dim reference ranking is itself sane.
+Defines three module-level constants consumed by ``bench.benchmark``:
+
+  CORPUS  : 35 documents across 6 topics, each as a 3-tuple (id, text, topic).
+            The ``id`` (e.g. ``"p1"``, ``"h3"``) is used by the sanity
+            checker to identify expected top results.
+
+  QUERIES : 9 search queries, each as a (query_text, expected_topic) tuple.
+            ``expected_topic`` is metadata only — not used in scoring.
+
+  SANITY  : dict mapping 4 query strings to sets of doc ids that are
+            obviously relevant.  Used before the benchmark to verify the
+            full-dim reference ranking is sensible.
+
+Running this file directly prints a data-load report (doc count, topic
+distribution, query count, sanity-pair count).
 """
 
 # (id, text, topic)
@@ -56,7 +67,7 @@ CORPUS = [
     ("h5", "Mindful breathing can lower stress and calm the nervous system.", "health"),
 ]
 
-# (query_text, expected_topic)
+# (query_text, expected_topic) — expected_topic is informational only
 QUERIES = [
     ("how do I catch and handle errors in my code", "programming"),
     ("ways to roll back changes in version control", "programming"),
@@ -69,7 +80,10 @@ QUERIES = [
     ("staying consistent with my treatment", "health"),
 ]
 
-# query_text -> set of doc ids that are obviously relevant (sanity check only)
+# query_text -> set of doc ids that are obviously relevant.
+# Used only as a sanity check on the full-dim reference ranking —
+# if the full-dim model cannot surface these, the benchmark curve is
+# built on a flawed reference and cannot be trusted.
 SANITY = {
     "how do I catch and handle errors in my code": {"p1"},
     "ways to roll back changes in version control": {"p2"},

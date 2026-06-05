@@ -54,7 +54,7 @@ Slicing a unit vector shortens it — the head no longer has length 1. **Re-norm
 
 ## Ground truth and recall@k
 
-The reference "correct" ranking is the **full 768-d top-k** for each query. recall@k then asks: *how many of a truncated dimension's top-k appear in the full-dim top-k?* This cleanly isolates the truncation effect — at dim=768 recall is 1.000 by construction, which also serves as a correctness check. A small hand-labelled sanity set (`SANITY_PAIRS`) confirms the full-dim reference is itself sensible before the curve is trusted.
+The reference "correct" ranking is the **full 768-d top-k** for each query. recall@k then asks: *how many of a truncated dimension's top-k appear in the full-dim top-k?* This cleanly isolates the truncation effect — at dim=768 recall is 1.000 by construction, which also serves as a correctness check. A small hand-labelled sanity dict (`SANITY`) confirms the full-dim reference is itself sensible before the curve is trusted.
 
 ---
 
@@ -96,7 +96,7 @@ Config (`config.py`, overrideable via `.env`): `OLLAMA_URL` (default `http://127
 is02p02-mrl-benchmarker/
   bench/
     embed.py        embed(text, kind) + truncate(vec, dim) + self-test
-    corpus.py       DOCS (35 texts, 6 topics), QUERIES (9), SANITY_PAIRS (4)
+    corpus.py       CORPUS (35 3-tuples of id/text/topic), QUERIES (9), SANITY (4-entry dict)
     benchmark.py    recall@k + latency + memory sweep across dims
     visualise.py    2-panel PNG: recall vs dim | memory vs dim
   config.py         pydantic-settings: OLLAMA_URL, EMBED_MODEL
@@ -108,51 +108,62 @@ is02p02-mrl-benchmarker/
 
 ## Algorithm & code flow
 
-### 1. Configuration (`config.py`)
+### 1. `config.py` — settings
 
-`Settings` is a pydantic-settings class that reads `OLLAMA_URL` and `EMBED_MODEL` from the environment or a `.env` file, with sensible defaults. All bench modules import a single `settings` instance from here.
+`Settings` is a pydantic-settings `BaseSettings` subclass. `SettingsConfigDict(env_file=".env", extra="ignore")` means values are read from environment variables or a `.env` file; unrecognised keys are silently ignored. A module-level singleton `settings = Settings()` is imported by all bench modules.
 
-### 2. Corpus (`bench/corpus.py`)
+Fields with defaults: `ollama_url = "http://127.0.0.1:11434"`, `embed_model = "nomic-embed-text"`. Override at the shell with e.g. `OLLAMA_URL=http://remote:11434 python -m bench.benchmark`.
 
-Defines three module-level constants:
-- `DOCS` — 35 sentences across 6 topics (machine learning, databases, web development, devops, security, algorithms). Each is a `(text, topic)` tuple.
-- `QUERIES` — 9 natural-language queries, one or two per topic.
-- `SANITY_PAIRS` — 4 hand-labelled `(query, expected_top_doc)` pairs used to verify the full-dim reference ranking is sensible.
+### 2. `bench/corpus.py` — dataset
 
-Running as `__main__` prints a data-load report (doc count, topic distribution, sanity check results).
+Three module-level constants:
 
-### 3. Embedding and truncation (`bench/embed.py`)
+- **`CORPUS`** — list of 35 `(id, text, topic)` 3-tuples across 6 topics (programming, finance, cooking, animals, sports, health). The `id` field (e.g. `"p1"`, `"h4"`) is used exclusively by the sanity checker to identify expected top results — the embedding engine never sees it.
+- **`QUERIES`** — list of 9 `(query_text, expected_topic)` tuples. Benchmark accesses `q[0]` for the text string. `expected_topic` is metadata only.
+- **`SANITY`** — `dict[str, set[str]]` mapping 4 query strings to sets of doc ids known to be obviously relevant. Used by `sanity_check()` in `benchmark.py` before the recall sweep begins.
 
-`embed(text, kind)` — prepends `search_document:` or `search_query:` prefix based on `kind`, POSTs to Ollama's `/api/embeddings` endpoint, extracts the vector, and L2-normalises it. Returns a 768-d numpy unit vector.
+`__main__` block counts docs by topic and prints a data-load report.
 
-`truncate(vec, dim)` — slices `vec[:dim]` and renormalises. Returns a `dim`-d unit vector.
+### 3. `bench/embed.py` — embedding and truncation
 
-Self-test (runs on `python -m bench.embed`): embeds 5 texts, truncates to all benchmark dims, asserts every norm is within 1e-6 of 1.0. Fails loudly if any vector is not on the unit sphere.
+**`_PREFIX` dict** — `{"document": "search_document: ", "query": "search_query: "}`. Prefixes are prepended to the text before sending to Ollama. Never add them yourself — `embed()` does it automatically.
 
-### 4. Benchmark (`bench/benchmark.py`)
+**`_l2_normalize(vec)`** — divides by `np.linalg.norm(vec)`; returns `vec` unchanged if norm is 0.0 (zero-vector guard). Called by both `embed()` and `truncate()`.
 
-The sweep runs in three phases:
+**`embed(text, kind="document") -> np.ndarray`** — validates `kind`, posts `{"model": settings.embed_model, "prompt": prefix + text}` to `{settings.ollama_url}/api/embeddings` with `timeout=60`, calls `resp.raise_for_status()`, extracts `resp.json()["embedding"]`, casts to `float32`, and passes through `_l2_normalize`. Returns shape `(768,)`.
 
-**Phase 1 — embed corpus once.** All 35 docs are embedded at full 768-d and stored as a `(35, 768)` matrix. This is done once; truncations are derived from these full-dim vectors.
+**`truncate(vec, dim) -> np.ndarray`** — raises `ValueError` if `dim > vec.shape[0]`, then returns `_l2_normalize(vec[:dim])`. Shape `(dim,)`.
 
-**Phase 2 — build ground truth.** For each of the 9 queries, embed at 768-d, truncate to 768 (no-op), cosine-search the full corpus, record the top-k indices as ground truth.
+**Self-test** (`python -m bench.embed`): embeds 5 texts (3 document, 2 query), asserts full-dim norm and all 5 truncated-dim norms are within `NORM_TOL = 1e-5` of 1.0. Total: 25 hard `AssertionError` checks. Prints one `OK` line per text showing all norms; ends with `"All norm checks passed."`.
 
-**Phase 3 — sweep dimensions.** For each dim in `[64, 128, 256, 512, 768]`:
-- Truncate all 35 doc vectors to `dim`-d.
-- For each query: truncate query vector to `dim`-d, cosine-search, get top-k indices.
-- recall@k = |truncated top-k ∩ full-dim top-k| / k.
-- Memory = `35 × dim × 4` bytes (float32).
-- Latency = `timeit` over 100 search calls.
+### 4. `bench/benchmark.py` — sweep engine
 
-Prints a formatted table at the end.
+**Constants:** `DIMS = [64, 128, 256, 512, 768]`, `K = 5`, `LATENCY_REPEATS = 50`.
 
-### 5. Visualisation (`bench/visualise.py`)
+**`rank(query_vec, doc_matrix)`** — `doc_matrix @ query_vec` gives a `(n,)` scores array, then `np.argsort(-scores)` returns indices best-first (negation avoids a reverse-slice).
 
-Calls `benchmark.run()`, then builds a 2-panel matplotlib figure:
-- Left panel: recall@k vs dimension (line + point markers).
-- Right panel: memory (KB) vs dimension (bar chart).
+**`embed_all()`** — embeds every `CORPUS` doc (`kind="document"`) and every `QUERIES` query (`kind="query"`) at full 768-d. Docs are stacked with `np.vstack(...)` into shape `(35, 768)`. Returns `(doc_ids, doc_vecs, query_vecs)`.
 
-Saves as `mrl_benchmark.png` in the project root.
+**`gold_topk(doc_vecs, query_vecs, k)`** — runs `rank()` at full dim for each query, takes `[:k]`, returns a list of `set[int]` — the ground-truth index sets.
+
+**`recall_at_k(td, tq, gold, k)`** — for each query: `got = set(rank(tq[i], td)[:k])`, recall = `len(got & gold[i]) / k`. Returns the mean across all 9 queries.
+
+**`search_latency_ms(td, tq)`** — `time.perf_counter` around `LATENCY_REPEATS × 9` `rank()` calls; divides total elapsed by `50 × 9` and multiplies by 1000 for milliseconds.
+
+**`sanity_check(doc_ids, doc_vecs, query_vecs)`** — builds `q_by_text = {query_text: vec}` from `QUERIES`/`query_vecs`, then for each of the 4 `SANITY` entries checks that `rank()[0]` returns a doc id in the expected set. Prints `[OK ]` or `[XX ]` per entry; returns `True` if all pass.
+
+**`run()`** — calls `embed_all()` → `sanity_check()` → `gold_topk()` → per-dim sweep (truncate docs+queries, `recall_at_k`, `search_latency_ms`, `mem_kb = td.nbytes / 1024.0`) → prints formatted table → returns results list.
+
+### 5. `bench/visualise.py` — chart
+
+`visualise(results, output_path="mrl_benchmark.png")`:
+- Unpacks `dim`, `recall`, `mem_kb` from each result dict.
+- `plt.subplots(1, 2, figsize=(12, 5))` — two side-by-side panels.
+- **Left panel** (`ax_q`): `plot(dims, recall, "o-", color="#2a7")`, dashed `axhline(1.0)` for the full-dim reference, `ylim(0, 1.05)`, value labels at `xytext=(0, 8)` offset.
+- **Right panel** (`ax_c`): `plot(dims, mem, "s-", color="#c63")`, value labels same offset.
+- `fig.tight_layout()`, `fig.savefig(output_path, dpi=120, bbox_inches="tight")`.
+
+`__main__` block calls `run()` then `visualise(results)`.
 
 ---
 
