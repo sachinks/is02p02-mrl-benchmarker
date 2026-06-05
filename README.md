@@ -203,4 +203,6 @@ This is why you can slice an MRL vector and still get a valid retrieval embeddin
 
 ---
 
+## License
+
 MIT © [Sachin Kolige](https://github.com/sachinks)
